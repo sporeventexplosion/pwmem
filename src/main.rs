@@ -1,5 +1,10 @@
 use std::arch::asm;
+use std::env;
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::mem;
+use std::process::exit;
+use std::time::Instant;
 
 use argon2::{Argon2, Block as Argon2Block};
 
@@ -10,47 +15,95 @@ const HASH_LEN: usize = 4;
 
 const SALT_LEN: usize = 64;
 
-fn main() {
-    use std::time::Instant;
+// File format: binary file that contains the hash and salt in order with no other data
+const FILE_LEN: usize = HASH_LEN + SALT_LEN;
 
+fn main() {
     if !disable_swap() {
-        panic!("Disabling swap with mlockall failed");
+        panic!("Error disabling swap with mlockall");
     }
+
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 2 || args[1].is_empty() {
+        eprintln!("Usage: {} <file>", args[0]);
+        exit(1);
+    }
+    let file_path: &str = &args[1];
+    let file_data = read_file(file_path);
+    let is_create = file_data.is_none();
+    if is_create {
+        println!("Creating new file {}", file_path);
+    } else {
+        println!("Using file {}", file_path);
+    }
+    // FIXME: remove
+    assert!(is_create);
+
+    let salt: &[u8];
+    let mut new_salt = [0u8; SALT_LEN];
+    let mut expected_hash = [0u8; HASH_LEN];
+    if let Some(ref input_file_data) = file_data {
+        // using existing file
+        salt = &input_file_data[HASH_LEN..(HASH_LEN + SALT_LEN)];
+        expected_hash.copy_from_slice(&input_file_data[0..HASH_LEN]);
+    } else {
+        // creating new file
+        generate_salt(&mut new_salt);
+        salt = &new_salt;
+    }
+    assert_eq!(salt.len(), SALT_LEN);
 
     let (hasher, mut blocks) = init_argon2();
-    let mut output = [0u8; HASH_LEN];
+    let mut digest = [0u8; HASH_LEN];
 
-    print!("Enter password: ");
-    use std::io::Write;
-    std::io::stdout().flush().unwrap();
-    let buf: ZodBuf;
-    let input: &[u8];
-    {
-        let disable_stdin_echo = DisableStdinEcho::new();
-        let mut len;
-        (buf, len) = secure_read_line(libc::STDIN_FILENO).expect("Read input failed");
-        if len > 0 && buf.get()[len - 1] == b'\n' {
-            len -= 1
-        };
-        input = &buf.get()[..len];
-        drop(disable_stdin_echo);
-    }
-
-    // FIXME: salt is bad
-    let salt = [0xffu8; 64];
+    let (password_buf, password_len) = read_password().expect("Error reading password");
+    let password = &password_buf.get()[..password_len];
 
     let start_time = Instant::now();
     hasher
-        .hash_password_into_with_memory(input, &salt, &mut output, &mut blocks)
-        .expect("Hashing password failed");
+        .hash_password_into_with_memory(password, &salt, &mut digest, &mut blocks)
+        .expect("Error hashing password");
     let duration = start_time.elapsed();
 
-    println!("{:?}", output.as_slice());
-    println!("Hashing took {} ms", duration.as_millis());
+    println!("Hash computed in {} ms", duration.as_millis());
+
+    let mut output_file_data = [0u8; FILE_LEN];
+    output_file_data[0..HASH_LEN].copy_from_slice(&digest);
+    output_file_data[HASH_LEN..(HASH_LEN + SALT_LEN)].copy_from_slice(&new_salt);
+    write_file(file_path, &output_file_data);
+    println!("File {} created", file_path);
 }
 
 fn disable_swap() -> bool {
     unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) == 0 }
+}
+
+fn read_file(file_path: &str) -> Option<Box<[u8]>> {
+    let mut file = match File::open(file_path) {
+        Ok(file) => file,
+        Err(err) => {
+            if err.kind() == io::ErrorKind::NotFound {
+                return None;
+            }
+            panic!("Error reading file {}: {}", file_path, err);
+        }
+    };
+    let metadata = file.metadata().expect("Error reading file metadata");
+
+    assert_eq!(
+        metadata.len(),
+        FILE_LEN as u64,
+        "Expected file to be exactly {} bytes long",
+        FILE_LEN
+    );
+    let mut ret = vec![0u8; FILE_LEN].into_boxed_slice();
+    file.read_exact(&mut ret).expect("Error reading file data");
+    Some(ret)
+}
+
+fn write_file(file_path: &str, data: &[u8]) {
+    assert_eq!(data.len(), FILE_LEN);
+    fs::write(file_path, data).expect("Error writing file");
 }
 
 fn set_stdin_echo(do_echo: bool) -> bool {
@@ -90,7 +143,7 @@ impl Drop for DisableStdinEcho {
         if !set_stdin_echo(true) {
             // Should be very unlikely that disabling echo succeeded but re-enabling it fails.
             // No good way to handle it here.
-            eprintln!("Re-enabling stdin echo failed");
+            eprintln!("Failed to re-enable stdin echo");
         }
     }
 }
@@ -98,7 +151,11 @@ impl Drop for DisableStdinEcho {
 fn init_argon2() -> (Argon2<'static>, Box<[Argon2Block]>) {
     // These settings take about 1.0 seconds on my machine.
     //
-    // TODO: increase this value when multithreading is added back to the argon2 library.
+    // It seems that in Argon2 parallelism *subdivides* the work instead of *multiplying* the work.
+    // With the current single threaded code, increasing P_COST does not significantly change the
+    // running time.
+    //
+    // TODO: increase these values when multithreading is added back to the argon2 library.
     // https://github.com/RustCrypto/password-hashes/issues/380
     const M_COST: u32 = 49152;
     const T_COST: u32 = 2;
@@ -215,4 +272,30 @@ fn secure_zero_memory(buf: &mut [u8]) {
              end = in(reg) end
         );
     }
+}
+
+fn read_password() -> Option<(ZodBuf, usize)> {
+    use std::io::Write;
+
+    print!("Enter password: ");
+    std::io::stdout().flush().unwrap();
+
+    let buf: ZodBuf;
+    let mut len;
+    {
+        let disable_stdin_echo = DisableStdinEcho::new();
+        (buf, len) = secure_read_line(libc::STDIN_FILENO)?;
+        if len > 0 && buf.get()[len - 1] == b'\n' {
+            len -= 1
+        };
+        drop(disable_stdin_echo);
+    }
+    Some((buf, len))
+}
+
+fn generate_salt(buf: &mut [u8]) {
+    File::open("/dev/urandom")
+        .expect("Error opening /dev/urandom for salt generation")
+        .read_exact(buf)
+        .expect("Error reading salt bytes from /dev/urandom");
 }
