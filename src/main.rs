@@ -3,7 +3,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::mem;
-use std::process::exit;
+use std::process::ExitCode;
 use std::time::Instant;
 
 use argon2::{Argon2, Block as Argon2Block};
@@ -18,7 +18,19 @@ const SALT_LEN: usize = 64;
 // File format: binary file that contains the hash and salt in order with no other data
 const FILE_LEN: usize = HASH_LEN + SALT_LEN;
 
-fn main() {
+// This wrapper only exists so the return type of the real main function can be bool.
+//
+// Don't use `exit()` anywhere in the program as that does not run the memory zeroing destructors.
+// Panics are fine when set to unwind (not abort) because unwinding calls destructors.
+fn main() -> ExitCode {
+    if pwmem_main() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn pwmem_main() -> bool {
     if !disable_swap() {
         panic!("Error disabling swap with mlockall");
     }
@@ -26,7 +38,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 || args[1].is_empty() {
         eprintln!("Usage: {} <file>", args[0]);
-        exit(1);
+        return false;
     }
     let file_path: &str = &args[1];
     let file_data = read_file(file_path);
@@ -45,7 +57,7 @@ fn main() {
     if let Some(ref input_file_data) = file_data {
         // using existing file
         salt = &input_file_data[HASH_LEN..(HASH_LEN + SALT_LEN)];
-        expected_hash.copy_from_slice(&input_file_data[0..HASH_LEN]);
+        expected_hash.copy_from_slice(&input_file_data[..HASH_LEN]);
     } else {
         // creating new file
         generate_salt(&mut new_salt);
@@ -56,22 +68,32 @@ fn main() {
     let (hasher, mut blocks) = init_argon2();
     let mut digest = [0u8; HASH_LEN];
 
-    let (password_buf, password_len) = read_password().expect("Error reading password");
-    let password = &password_buf.get()[..password_len];
+    let (password_1_buf, password_1_len) =
+        read_password("Enter new password: ").expect("Error reading password");
+    if password_1_len == 0 {
+        eprintln!("Passwords do not match");
+        return false;
+    }
+    let password_1 = &password_1_buf.get()[..password_1_len];
 
-    let start_time = Instant::now();
-    hasher
-        .hash_password_into_with_memory(password, &salt, &mut digest, &mut blocks)
-        .expect("Error hashing password");
-    let duration = start_time.elapsed();
+    let (password_2_buf, password_2_len) =
+        read_password("Enter new password again: ").expect("Error reading password");
+    let password_2 = &password_2_buf.get()[..password_2_len];
 
-    println!("Hash computed in {} ms", duration.as_millis());
+    if (password_1_len != password_2_len) || !constant_time_equals(password_1, password_2) {
+        eprintln!("Passwords do not match");
+        return false;
+    }
+
+    hash_password(&hasher, &mut blocks, password_1, salt, &mut digest);
 
     let mut output_file_data = [0u8; FILE_LEN];
-    output_file_data[0..HASH_LEN].copy_from_slice(&digest);
+    output_file_data[..HASH_LEN].copy_from_slice(&digest);
     output_file_data[HASH_LEN..(HASH_LEN + SALT_LEN)].copy_from_slice(&new_salt);
     write_file(file_path, &output_file_data);
     println!("File {} created", file_path);
+
+    true
 }
 
 fn disable_swap() -> bool {
@@ -169,13 +191,20 @@ fn init_argon2() -> (Argon2<'static>, Box<[Argon2Block]>) {
     (hasher, blocks.into_boxed_slice())
 }
 
-fn get_digest(
+fn hash_password(
     hasher: &Argon2,
     blocks: &mut [Argon2Block],
-    input: &[u8],
+    password: &[u8],
     salt: &[u8],
-    output: &[u8],
+    digest: &mut [u8],
 ) {
+    let start_time = Instant::now();
+    hasher
+        .hash_password_into_with_memory(password, salt, digest, blocks)
+        .expect("Error hashing password");
+    let duration = start_time.elapsed();
+
+    println!("Hash computed in {} ms", duration.as_millis());
 }
 
 // Zod: zero on drop
@@ -274,11 +303,14 @@ fn secure_zero_memory(buf: &mut [u8]) {
     }
 }
 
-fn read_password() -> Option<(ZodBuf, usize)> {
+fn read_password(prompt: &str) -> Option<(ZodBuf, usize)> {
     use std::io::Write;
 
-    print!("Enter password: ");
-    std::io::stdout().flush().unwrap();
+    {
+        let mut stdout = io::stdout();
+        stdout.write_all(prompt.as_bytes()).unwrap();
+        stdout.flush().unwrap();
+    }
 
     let buf: ZodBuf;
     let mut len;
@@ -290,6 +322,8 @@ fn read_password() -> Option<(ZodBuf, usize)> {
         };
         drop(disable_stdin_echo);
     }
+
+    io::stdout().write_all("\n".as_bytes()).unwrap();
     Some((buf, len))
 }
 
@@ -298,4 +332,33 @@ fn generate_salt(buf: &mut [u8]) {
         .expect("Error opening /dev/urandom for salt generation")
         .read_exact(buf)
         .expect("Error reading salt bytes from /dev/urandom");
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn constant_time_equals(a: &[u8], b: &[u8]) -> bool {
+    assert_eq!(a.len(), b.len());
+    unsafe {
+        let len = a.len();
+        let a_start = a.as_ptr() as usize;
+        let a_end = a_start + len;
+        let b_start = b.as_ptr() as usize;
+        let mut out: u8 = 0;
+        asm!("2:",
+             "cmp {a}, {a_end}",
+             "je 3f",
+             "mov {scratch}, byte ptr [{a}]",
+             "xor {scratch}, byte ptr [{b}]",
+             "or {out}, {scratch}",
+             "inc {a}",
+             "inc {b}",
+             "jmp 2b",
+             "3:",
+             a = inout(reg) a_start => _,
+             b = inout(reg) b_start => _,
+             a_end = in(reg) a_end,
+             scratch = out(reg_byte) _,
+             out = inout(reg_byte) out,
+        );
+        out == 0
+    }
 }
