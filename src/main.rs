@@ -24,8 +24,10 @@ const FILE_LEN: usize = DIGEST_LEN + SALT_LEN;
 // Panics are fine when set to unwind (not abort) because unwinding calls destructors.
 fn main() -> ExitCode {
     if pwmem_main() {
+        println!("Exiting cleanly with successful exit code");
         ExitCode::SUCCESS
     } else {
+        println!("Exiting cleanly with non-successful exit code");
         ExitCode::FAILURE
     }
 }
