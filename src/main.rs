@@ -36,6 +36,9 @@ fn pwmem_main() -> bool {
     if !disable_swap() {
         panic!("Error disabling swap with mlockall");
     }
+    // Nothing in the program currently requires showing stdin input on screen
+    // so we only re-enable on exit
+    let _enable_stdin_echo_on_drop = EnableStdinEchoOnDrop::new();
 
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 || args[1].is_empty() {
@@ -207,20 +210,15 @@ fn set_stdin_echo(do_echo: bool) -> bool {
     true
 }
 
-// Unexpected behavior may result if multiple objects exist at the same time
-#[must_use]
-struct DisableStdinEcho {}
+struct EnableStdinEchoOnDrop {}
 
-impl DisableStdinEcho {
-    fn new() -> Option<Self> {
-        if !set_stdin_echo(false) {
-            return None;
-        }
-        Some(Self {})
+impl EnableStdinEchoOnDrop {
+    fn new() -> Self {
+        Self {}
     }
 }
 
-impl Drop for DisableStdinEcho {
+impl Drop for EnableStdinEchoOnDrop {
     fn drop(&mut self) {
         if !set_stdin_echo(true) {
             // Should be very unlikely that disabling echo succeeded but re-enabling it fails.
@@ -443,7 +441,9 @@ fn secure_zero_memory_aligned_16(buf: &mut [u8]) {
 
 fn read_password(prompt: &str) -> Option<(ZodBuf, usize)> {
     use std::io::Write;
-
+    // We disable stdin echo each time without re-enabling in order to flush the kernel stdin
+    // buffer. There might be a better way but I'm lazy.
+    set_stdin_echo(false);
     {
         let mut stdout = io::stdout();
         stdout.write_all(prompt.as_bytes()).unwrap();
@@ -453,12 +453,10 @@ fn read_password(prompt: &str) -> Option<(ZodBuf, usize)> {
     let buf: ZodBuf;
     let mut len;
     {
-        let disable_stdin_echo = DisableStdinEcho::new();
         (buf, len) = secure_read_line(libc::STDIN_FILENO)?;
         if len > 0 && buf.get()[len - 1] == b'\n' {
             len -= 1
         };
-        drop(disable_stdin_echo);
     }
 
     io::stdout().write_all("\n".as_bytes()).unwrap();
